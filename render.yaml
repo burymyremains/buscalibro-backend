@@ -1,0 +1,14 @@
+# Despliegue de la API en Render (plan gratuito). Render lo lee al conectar el repositorio.
+services:
+  - type: web
+    name: biblioteca-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: MONGO_URI
+        sync: false        # la pegas tú en el panel de Render (cadena de Atlas)
+      - key: JWT_SECRET
+        generateValue: true

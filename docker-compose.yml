@@ -1,0 +1,14 @@
+# Levanta MongoDB en un contenedor. Los datos se guardan en el volumen "mongo_data"
+# y no se pierden al apagar el contenedor.
+services:
+  mongo:
+    image: mongo:7
+    container_name: biblioteca-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:

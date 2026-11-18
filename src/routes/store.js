@@ -1,0 +1,234 @@
+import { Router } from 'express';
+import mongoose from 'mongoose';
+import jwt from 'jsonwebtoken';
+import { requireAuth } from '../middleware/auth.js';
+
+const router = Router();
+const db = () => mongoose.connection.db;
+
+// Login / Auto-registro rápido para usuarios de la app móvil
+router.post('/auth/mobile-login', async (req, res) => {
+  const { email, username } = req.body || {};
+  if (!email) return res.status(400).json({ message: 'Email requerido' });
+
+  const cleanEmail = String(email).toLowerCase().trim();
+  const col = db().collection('mobile_users');
+  let user = await col.findOne({ email: cleanEmail });
+
+  if (!user) {
+    const newUser = {
+      id: `user-${Date.now()}`,
+      email: cleanEmail,
+      username: username || cleanEmail.split('@')[0],
+      bio: '',
+      avatarKey: 'avatars/default-1.png',
+      registeredAt: new Date().toISOString().split('T')[0],
+      favorites: [],
+      followedAuthors: [],
+      cart: [],
+      notifications: [],
+      notificationPrefs: { enabled: true, favoriteDiscounts: true, orderUpdates: true },
+    };
+    await col.insertOne(newUser);
+    user = newUser;
+  }
+
+  const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '180d' });
+  res.json({ token, profile: { ...user, isAuthenticated: true } });
+});
+
+// Catálogo público y autores
+router.get('/books', async (_req, res) => {
+  const books = await db().collection('store_books').find({}).toArray();
+  res.json(books);
+});
+
+router.get('/authors', async (_req, res) => {
+  const authors = await db().collection('store_authors').find({}).toArray();
+  res.json(authors);
+});
+
+// Perfil del usuario autenticado
+router.get('/me/profile', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  if (!user) return res.status(404).json({ message: 'No encontrado' });
+  res.json({ ...user, isAuthenticated: true });
+});
+
+router.patch('/me/profile', requireAuth, async (req, res) => {
+  const { username, email, bio, avatarKey } = req.body || {};
+  const updates = {};
+  if (username !== undefined) updates.username = username;
+  if (email !== undefined) updates.email = email;
+  if (bio !== undefined) updates.bio = bio;
+  if (avatarKey !== undefined) updates.avatarKey = avatarKey;
+
+  await db().collection('mobile_users').updateOne({ id: req.user.id }, { $set: updates });
+  const updated = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json({ ...updated, isAuthenticated: true });
+});
+
+// Favoritos
+router.get('/me/favorites', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.favorites || []);
+});
+
+router.post('/me/favorites/:bookId', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  const current = user?.favorites || [];
+  const { bookId } = req.params;
+  const updated = current.includes(bookId) ? current.filter((id) => id !== bookId) : [...current, bookId];
+  await db().collection('mobile_users').updateOne({ id: req.user.id }, { $set: { favorites: updated } });
+  res.json(updated);
+});
+
+// Autores seguidos
+router.get('/me/following-authors', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.followedAuthors || []);
+});
+
+router.post('/me/following-authors/:authorId', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  const current = user?.followedAuthors || [];
+  const { authorId } = req.params;
+  const updated = current.includes(authorId) ? current.filter((id) => id !== authorId) : [...current, authorId];
+  await db().collection('mobile_users').updateOne({ id: req.user.id }, { $set: { followedAuthors: updated } });
+  res.json(updated);
+});
+
+// Carrito
+router.get('/me/cart', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.cart || []);
+});
+
+router.put('/me/cart', requireAuth, async (req, res) => {
+  const items = req.body?.items || [];
+  await db().collection('mobile_users').updateOne({ id: req.user.id }, { $set: { cart: items } });
+  res.json(items);
+});
+
+// Reseñas
+router.get('/reviews', async (_req, res) => {
+  const reviews = await db().collection('store_reviews').find({}).sort({ _id: -1 }).toArray();
+  res.json(reviews);
+});
+
+router.post('/reviews', requireAuth, async (req, res) => {
+  const doc = {
+    id: `rev-${Date.now()}`,
+    ...req.body,
+    userId: req.user.id,
+    createdAt: new Date().toISOString().split('T')[0],
+  };
+  await db().collection('store_reviews').insertOne(doc);
+  const all = await db().collection('store_reviews').find({}).sort({ _id: -1 }).toArray();
+  res.json(all);
+});
+
+router.put('/reviews/:id', requireAuth, async (req, res) => {
+  await db().collection('store_reviews').updateOne(
+    { id: req.params.id, userId: req.user.id },
+    { $set: { rating: req.body.rating, comment: req.body.comment, editedAt: new Date().toISOString().split('T')[0] } }
+  );
+  const all = await db().collection('store_reviews').find({}).sort({ _id: -1 }).toArray();
+  res.json(all);
+});
+
+router.delete('/reviews/:id', requireAuth, async (req, res) => {
+  await db().collection('store_reviews').deleteOne({ id: req.params.id, userId: req.user.id });
+  const all = await db().collection('store_reviews').find({}).sort({ _id: -1 }).toArray();
+  res.json(all);
+});
+
+// Compras y rastreo
+router.get('/me/orders', requireAuth, async (req, res) => {
+  const orders = await db().collection('store_orders').find({ userId: req.user.id }).sort({ _id: -1 }).toArray();
+  res.json(orders);
+});
+
+router.post('/me/orders', requireAuth, async (req, res) => {
+  const now = new Date().toLocaleString('es-MX', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+  const order = {
+    id: `ORD-${Math.floor(100000 + Math.random() * 900000)}`,
+    userId: req.user.id,
+    createdAt: now,
+    status: 'Pendiente',
+    statusHistory: [{ status: 'Pendiente', timestamp: now }],
+    ...req.body,
+  };
+  await db().collection('store_orders').insertOne(order);
+  await db().collection('mobile_users').updateOne({ id: req.user.id }, { $set: { cart: [] } });
+  res.json(order);
+});
+
+router.patch('/me/orders/:id/status', requireAuth, async (req, res) => {
+  const flow = ['Pendiente', 'Procesando', 'Enviado', 'Entregado'];
+  const order = await db().collection('store_orders').findOne({ id: req.params.id, userId: req.user.id });
+  if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
+
+  const idx = flow.indexOf(order.status);
+  let changedOrder = null;
+  if (idx !== -1 && idx < flow.length - 1) {
+    const nextStatus = flow[idx + 1];
+    const timestamp = new Date().toLocaleString('es-MX', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+    await db().collection('store_orders').updateOne(
+      { id: order.id },
+      { $set: { status: nextStatus }, $push: { statusHistory: { status: nextStatus, timestamp } } }
+    );
+    changedOrder = await db().collection('store_orders').findOne({ id: order.id });
+  }
+  const orders = await db().collection('store_orders').find({ userId: req.user.id }).sort({ _id: -1 }).toArray();
+  res.json({ orders, changedOrder });
+});
+
+// Notificaciones y preferencias
+router.get('/me/notifications', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.notifications || []);
+});
+
+router.post('/me/notifications', requireAuth, async (req, res) => {
+  const item = { id: `notif-${Date.now()}`, read: false, createdAt: 'Ahora mismo', ...req.body };
+  await db().collection('mobile_users').updateOne(
+    { id: req.user.id },
+    { $push: { notifications: { $each: [item], $position: 0 } } }
+  );
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.notifications || []);
+});
+
+router.patch('/me/notifications/:id/read', requireAuth, async (req, res) => {
+  await db().collection('mobile_users').updateOne(
+    { id: req.user.id, 'notifications.id': req.params.id },
+    { $set: { 'notifications.$.read': true } }
+  );
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.notifications || []);
+});
+
+router.patch('/me/notifications/read-all', requireAuth, async (req, res) => {
+  await db().collection('mobile_users').updateOne(
+    { id: req.user.id },
+    { $set: { 'notifications.$[].read': true } }
+  );
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.notifications || []);
+});
+
+router.get('/me/notification-prefs', requireAuth, async (req, res) => {
+  const user = await db().collection('mobile_users').findOne({ id: req.user.id });
+  res.json(user?.notificationPrefs || { enabled: true });
+});
+
+router.put('/me/notification-prefs', requireAuth, async (req, res) => {
+  await db().collection('mobile_users').updateOne(
+    { id: req.user.id },
+    { $set: { notificationPrefs: req.body } }
+  );
+  res.json(req.body);
+});
+
+export default router;
