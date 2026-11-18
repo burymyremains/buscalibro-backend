@@ -7,6 +7,7 @@ import bookRoutes from './routes/books.js';
 import categoryRoutes from './routes/categories.js';
 import orderRoutes from './routes/orders.js';
 import storeRoutes from './routes/store.js';
+import storeRoutes from './routes/store.js';
 
 const { PORT = 3000, MONGO_URI, JWT_SECRET } = process.env;
 if (!MONGO_URI || !JWT_SECRET) {
@@ -25,8 +26,9 @@ app.use('/api/categories', categoryRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/store', storeRoutes);
 
-app.use((_req, res) => res.status(404).json({ message: 'Ruta no encontrada' }));
-
+app.use((req, res) => {
+  res.status(404).json({ message: 'Ruta no encontrada' });
+});
 const DUPLICATES = { isbn: 'Ya existe un libro con ese ISBN', email: 'Ya existe una cuenta con ese email', name: 'Ya existe un género con ese nombre' };
 
 // Manejo central de errores: convierte errores de Mongoose en respuestas claras
