@@ -2,6 +2,9 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import { requireAuth } from '../middleware/auth.js';
+import mongoose from 'mongoose';
+import jwt from 'jsonwebtoken';
+import { sendExpoPush } from '../utils/pushService.js';
 
 const router = Router();
 const db = () => mongoose.connection.db;
@@ -229,6 +232,177 @@ router.put('/me/notification-prefs', requireAuth, async (req, res) => {
     { $set: { notificationPrefs: req.body } }
   );
   res.json(req.body);
+});
+
+function extractUserFromToken(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return null;
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+function buildUserFilter(decoded) {
+  const filters = [];
+  if (decoded?.email) filters.push({ email: decoded.email });
+  if (decoded?.id) filters.push({ id: decoded.id });
+  if (decoded?.userId) filters.push({ id: decoded.userId });
+  const rawId = decoded?.userId || decoded?.id || decoded?._id;
+  if (rawId && mongoose.Types.ObjectId.isValid(rawId)) {
+    filters.push({ _id: new mongoose.Types.ObjectId(rawId) });
+  }
+  return filters.length ? { $or: filters } : null;
+}
+
+// 1. Guardar token Push del celular del usuario
+router.patch('/me/push-token', async (req, res) => {
+  try {
+    const decoded = extractUserFromToken(req);
+    const filter = buildUserFilter(decoded);
+    const { pushToken } = req.body;
+    if (!filter || !pushToken) return res.status(400).json({ message: 'Datos incompletos' });
+
+    await mongoose.connection
+      .collection('mobile_users')
+      .updateOne(filter, { $set: { expoPushToken: pushToken } });
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// 2. Consultar datos automáticos por código de barras ISBN (Google Books + OpenLibrary)
+router.get('/isbn/:code', async (req, res) => {
+  const isbn = String(req.params.code || '').replace(/[^0-9Xx]/g, '');
+  if (!isbn) return res.status(400).json({ message: 'ISBN inválido' });
+
+  try {
+    const gbRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`);
+    const gbData = await gbRes.json();
+    const info = gbData?.items?.[0]?.volumeInfo;
+
+    if (info) {
+      return res.json({
+        found: true,
+        title: info.title || '',
+        authorName: info.authors?.[0] || 'Autor desconocido',
+        genre: info.categories?.[0] || 'General',
+        description: info.description || `Edición ISBN ${isbn}.`,
+        coverUrl: info.imageLinks?.thumbnail?.replace('http://', 'https://') || '',
+        pageCount: info.pageCount || 200,
+      });
+    }
+
+    const olRes = await fetch(
+      `https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`
+    );
+    const olData = await olRes.json();
+    const book = olData[`ISBN:${isbn}`];
+
+    if (book) {
+      return res.json({
+        found: true,
+        title: book.title || '',
+        authorName: book.authors?.[0]?.name || 'Autor desconocido',
+        genre: book.subjects?.[0]?.name || 'General',
+        description: book.notes || `Obra registrada con ISBN ${isbn}.`,
+        coverUrl: book.cover?.large || book.cover?.medium || '',
+        pageCount: book.number_of_pages || 200,
+      });
+    }
+
+    res.json({ found: false });
+  } catch (err) {
+    res.status(500).json({ message: 'Error consultando ISBN' });
+  }
+});
+
+// 3. Publicar un libro nuevo en el catálogo + enviar Push a todos los usuarios
+router.post('/books', async (req, res) => {
+  try {
+    const {
+      title,
+      authorName,
+      genre,
+      price,
+      discountPercent = 0,
+      description,
+      coverKey,
+      stock = 10,
+    } = req.body;
+
+    if (!title || !authorName || !price) {
+      return res.status(400).json({ message: 'Título, autor y precio son obligatorios' });
+    }
+
+    const newBook = {
+      id: `book-${Date.now()}`,
+      title: title.trim(),
+      authorId: 'auth-community',
+      authorName: authorName.trim(),
+      genre: (genre || 'Literatura').trim(),
+      price: Number(price),
+      discountPercent: Number(discountPercent || 0),
+      badge: Number(discountPercent) > 0 ? 'Oferta' : 'Nuevo',
+      coverKey: coverKey || 'covers/cien-anos.jpg',
+      coverTint: '#FADADD',
+      stock: Number(stock),
+      recommended: true,
+      bestseller: false,
+      isNewRelease: true,
+      description: (description || 'Publicado en el catálogo de BuscaLibroo.').trim(),
+      createdAt: new Date(),
+    };
+
+    await mongoose.connection.collection('store_books').insertOne(newBook);
+
+    // Notificación Push masiva a usuarios con token registrado
+    const users = await mongoose.connection
+      .collection('mobile_users')
+      .find({ expoPushToken: { $exists: true, $ne: '' } })
+      .toArray();
+
+    const tokens = users.map((u) => u.expoPushToken);
+    await sendExpoPush(tokens, {
+      title: '📚 ¡Nuevo lanzamiento en BuscaLibroo!',
+      body: `"${newBook.title}" de ${newBook.authorName} ya está disponible.`,
+      data: { bookId: newBook.id },
+    });
+
+    res.status(201).json(newBook);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// 4. Actualizar progreso de lectura en un pedido entregado
+router.patch('/me/orders/:orderId/progress', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { bookId, currentPage, totalPages } = req.body;
+
+    const query = mongoose.Types.ObjectId.isValid(orderId)
+      ? { $or: [{ id: orderId }, { _id: new mongoose.Types.ObjectId(orderId) }] }
+      : { id: orderId };
+
+    await mongoose.connection.collection('store_orders').updateOne(query, {
+      $set: {
+        [`readingProgress.${bookId}`]: {
+          currentPage: Number(currentPage || 0),
+          totalPages: Math.max(1, Number(totalPages || 100)),
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 export default router;
