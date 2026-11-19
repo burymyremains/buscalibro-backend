@@ -565,4 +565,88 @@ router.patch('/me/orders/:orderId/progress', async (req, res) => {
   }
 });
 
+// Editar un libro aprobado en el catálogo
+router.patch('/books/:bookId', async (req, res) => {
+  try {
+    const decoded = extractUserFromToken(req);
+    const filter = buildUserFilter(decoded);
+    if (!filter) return res.status(401).json({ message: 'No autorizado' });
+
+    const user = await db().collection('mobile_users').findOne(filter);
+    if (!user) return res.status(401).json({ message: 'Usuario no encontrado' });
+
+    const { bookId } = req.params;
+    const bookQuery = mongoose.Types.ObjectId.isValid(bookId)
+      ? { $or: [{ id: bookId }, { _id: new mongoose.Types.ObjectId(bookId) }] }
+      : { id: bookId };
+
+    const book = await db().collection('store_books').findOne(bookQuery);
+    if (!book) return res.status(404).json({ message: 'Libro no encontrado' });
+
+    const isOwner =
+      book.submittedByEmail &&
+      user.email &&
+      book.submittedByEmail.toLowerCase() === user.email.toLowerCase();
+
+    if (!user.canPublish && !isOwner) {
+      return res.status(403).json({ message: 'No tienes permiso para editar este libro' });
+    }
+
+    const { title, authorName, genre, price, discountPercent, stock, description } = req.body;
+    const updates = {};
+    if (title !== undefined) updates.title = String(title).trim();
+    if (authorName !== undefined) updates.authorName = String(authorName).trim();
+    if (genre !== undefined) updates.genre = String(genre).trim();
+    if (price !== undefined) updates.price = Number(price);
+    if (discountPercent !== undefined) {
+      const disc = Number(discountPercent || 0);
+      updates.discountPercent = disc;
+      updates.badge = disc > 0 ? 'Oferta' : book.badge === 'Oferta' ? 'Disponible' : book.badge;
+    }
+    if (stock !== undefined) updates.stock = Math.max(0, Number(stock));
+    if (description !== undefined) updates.description = String(description).trim();
+    updates.updatedAt = new Date();
+
+    await db().collection('store_books').updateOne(bookQuery, { $set: updates });
+    const updatedBook = await db().collection('store_books').findOne(bookQuery);
+    res.json(updatedBook);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Eliminar un libro aprobado del catálogo
+router.delete('/books/:bookId', async (req, res) => {
+  try {
+    const decoded = extractUserFromToken(req);
+    const filter = buildUserFilter(decoded);
+    if (!filter) return res.status(401).json({ message: 'No autorizado' });
+
+    const user = await db().collection('mobile_users').findOne(filter);
+    if (!user) return res.status(401).json({ message: 'Usuario no encontrado' });
+
+    const { bookId } = req.params;
+    const bookQuery = mongoose.Types.ObjectId.isValid(bookId)
+      ? { $or: [{ id: bookId }, { _id: new mongoose.Types.ObjectId(bookId) }] }
+      : { id: bookId };
+
+    const book = await db().collection('store_books').findOne(bookQuery);
+    if (!book) return res.status(404).json({ message: 'Libro no encontrado' });
+
+    const isOwner =
+      book.submittedByEmail &&
+      user.email &&
+      book.submittedByEmail.toLowerCase() === user.email.toLowerCase();
+
+    if (!user.canPublish && !isOwner) {
+      return res.status(403).json({ message: 'No tienes permiso para eliminar este libro' });
+    }
+
+    await db().collection('store_books').deleteOne(bookQuery);
+    res.json({ ok: true, deletedId: book.id });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 export default router;
