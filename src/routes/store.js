@@ -40,8 +40,17 @@ router.post('/auth/mobile-login', async (req, res) => {
 
 // Catálogo público y autores
 router.get('/books', async (_req, res) => {
-  const books = await db().collection('store_books').find({}).toArray();
-  res.json(books);
+ router.get('/books', async (req, res) => {
+  try {
+    const books = await mongoose.connection
+      .collection('store_books')
+      .find({ approvalStatus: { $nin: ['pending', 'rejected'] } })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(books);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 router.get('/authors', async (_req, res) => {
@@ -320,8 +329,15 @@ router.get('/isbn/:code', async (req, res) => {
 });
 
 // 3. Publicar un libro nuevo en el catálogo + enviar Push a todos los usuarios
+// Crear solicitud de libro (queda 'pending' si es usuario normal, o 'approved' si tienes canPublish: true)
 router.post('/books', async (req, res) => {
   try {
+    const decoded = extractUserFromToken(req);
+    const userFilter = buildUserFilter(decoded);
+    const submitter = userFilter
+      ? await mongoose.connection.collection('mobile_users').findOne(userFilter)
+      : null;
+
     const {
       title,
       authorName,
@@ -336,6 +352,9 @@ router.post('/books', async (req, res) => {
     if (!title || !authorName || !price) {
       return res.status(400).json({ message: 'Título, autor y precio son obligatorios' });
     }
+
+    const isCurator = Boolean(submitter?.canPublish);
+    const approvalStatus = isCurator ? 'approved' : 'pending';
 
     const newBook = {
       id: `book-${Date.now()}`,
@@ -353,25 +372,129 @@ router.post('/books', async (req, res) => {
       bestseller: false,
       isNewRelease: true,
       description: (description || 'Publicado en el catálogo de BuscaLibroo.').trim(),
+      approvalStatus,
+      submittedByEmail: submitter?.email || 'lector@buscalibroo.app',
+      submittedByName: submitter?.name || 'Lector',
+      submittedByPushToken: submitter?.expoPushToken || '',
       createdAt: new Date(),
     };
 
     await mongoose.connection.collection('store_books').insertOne(newBook);
 
-    // Notificación Push masiva a usuarios con token registrado
-    const users = await mongoose.connection
-      .collection('mobile_users')
-      .find({ expoPushToken: { $exists: true, $ne: '' } })
-      .toArray();
+    if (isCurator) {
+      const users = await mongoose.connection
+        .collection('mobile_users')
+        .find({ expoPushToken: { $exists: true, $ne: '' } })
+        .toArray();
 
-    const tokens = users.map((u) => u.expoPushToken);
-    await sendExpoPush(tokens, {
-      title: '📚 ¡Nuevo lanzamiento en BuscaLibroo!',
-      body: `"${newBook.title}" de ${newBook.authorName} ya está disponible.`,
-      data: { bookId: newBook.id },
-    });
+      await sendExpoPush(
+        users.map((u) => u.expoPushToken),
+        {
+          title: '📚 ¡Nuevo lanzamiento en BuscaLibroo!',
+          body: `"${newBook.title}" de ${newBook.authorName} ya está disponible.`,
+          data: { bookId: newBook.id },
+        }
+      );
+    }
 
     res.status(201).json(newBook);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Ver mis propias solicitudes (para cualquier usuario)
+router.get('/me/book-requests', async (req, res) => {
+  try {
+    const decoded = extractUserFromToken(req);
+    if (!decoded?.email) return res.json([]);
+    const list = await mongoose.connection
+      .collection('store_books')
+      .find({ submittedByEmail: decoded.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Ver solicitudes pendientes (solo usuarios con canPublish: true)
+router.get('/books/pending', async (req, res) => {
+  try {
+    const decoded = extractUserFromToken(req);
+    const filter = buildUserFilter(decoded);
+    if (!filter) return res.status(401).json({ message: 'No autorizado' });
+
+    const user = await mongoose.connection.collection('mobile_users').findOne(filter);
+    if (!user?.canPublish) return res.status(403).json({ message: 'Sin permisos' });
+
+    const pending = await mongoose.connection
+      .collection('store_books')
+      .find({ approvalStatus: 'pending' })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(pending);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Aprobar o rechazar solicitud
+router.patch('/books/:bookId/review', async (req, res) => {
+  try {
+    const decoded = extractUserFromToken(req);
+    const filter = buildUserFilter(decoded);
+    if (!filter) return res.status(401).json({ message: 'No autorizado' });
+
+    const reviewer = await mongoose.connection.collection('mobile_users').findOne(filter);
+    if (!reviewer?.canPublish) return res.status(403).json({ message: 'Sin permisos' });
+
+    const { bookId } = req.params;
+    const { action } = req.body; // 'approve' | 'reject'
+    const approvalStatus = action === 'approve' ? 'approved' : 'rejected';
+
+    const bookQuery = mongoose.Types.ObjectId.isValid(bookId)
+      ? { $or: [{ id: bookId }, { _id: new mongoose.Types.ObjectId(bookId) }] }
+      : { id: bookId };
+
+    const book = await mongoose.connection.collection('store_books').findOne(bookQuery);
+    if (!book) return res.status(404).json({ message: 'Solicitud no encontrada' });
+
+    await mongoose.connection.collection('store_books').updateOne(bookQuery, {
+      $set: { approvalStatus, reviewedAt: new Date() },
+    });
+
+    // Notificar al usuario que envió la solicitud
+    if (book.submittedByPushToken) {
+      await sendExpoPush([book.submittedByPushToken], {
+        title: action === 'approve' ? '✅ ¡Tu libro fue aprobado!' : '❌ Solicitud no aprobada',
+        body:
+          action === 'approve'
+            ? `"${book.title}" ya está publicado en el catálogo de BuscaLibroo.`
+            : `Tu propuesta "${book.title}" no cumplió los criterios del catálogo.`,
+        data: { bookId: book.id },
+      });
+    }
+
+    // Si se aprobó, notificar el nuevo libro a todos los usuarios
+    if (action === 'approve') {
+      const users = await mongoose.connection
+        .collection('mobile_users')
+        .find({ expoPushToken: { $exists: true, $ne: '' } })
+        .toArray();
+
+      await sendExpoPush(
+        users.map((u) => u.expoPushToken),
+        {
+          title: '📚 ¡Nuevo libro en BuscaLibroo!',
+          body: `"${book.title}" de ${book.authorName} ya está disponible.`,
+          data: { bookId: book.id },
+        }
+      );
+    }
+
+    res.json({ ok: true, approvalStatus });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
