@@ -7,7 +7,6 @@ import bookRoutes from './routes/books.js';
 import categoryRoutes from './routes/categories.js';
 import orderRoutes from './routes/orders.js';
 import storeRoutes from './routes/store.js';
-import storeRoutes from './routes/store.js';
 
 const { PORT = 3000, MONGO_URI, JWT_SECRET } = process.env;
 if (!MONGO_URI || !JWT_SECRET) {
