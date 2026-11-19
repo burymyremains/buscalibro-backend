@@ -39,7 +39,6 @@ router.post('/auth/mobile-login', async (req, res) => {
 });
 
 // Catálogo público y autores
-router.get('/books', async (_req, res) => {
  router.get('/books', async (req, res) => {
   try {
     const books = await mongoose.connection
