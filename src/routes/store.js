@@ -7,6 +7,29 @@ import { sendExpoPush } from '../utils/pushService.js';
 const router = Router();
 const db = () => mongoose.connection.db;
 
+function extractUserFromToken(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return null;
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+function buildUserFilter(decoded) {
+  const filters = [];
+  if (decoded?.email) filters.push({ email: decoded.email });
+  if (decoded?.id) filters.push({ id: decoded.id });
+  if (decoded?.userId) filters.push({ id: decoded.userId });
+  const rawId = decoded?.userId || decoded?.id || decoded?._id;
+  if (rawId && mongoose.Types.ObjectId.isValid(rawId)) {
+    filters.push({ _id: new mongoose.Types.ObjectId(rawId) });
+  }
+  return filters.length ? { $or: filters } : null;
+}
+
 // Login / Auto-registro rápido para usuarios de la app móvil
 router.post('/auth/mobile-login', async (req, res) => {
   const { email, username } = req.body || {};
@@ -38,10 +61,10 @@ router.post('/auth/mobile-login', async (req, res) => {
   res.json({ token, profile: { ...user, isAuthenticated: true } });
 });
 
-// Catálogo público y autores
- router.get('/books', async (req, res) => {
+// Catálogo público y autores (oculta libros pendientes o rechazados)
+router.get('/books', async (_req, res) => {
   try {
-    const books = await mongoose.connection
+    const books = await db()
       .collection('store_books')
       .find({ approvalStatus: { $nin: ['pending', 'rejected'] } })
       .sort({ createdAt: -1 })
@@ -185,7 +208,7 @@ router.patch('/me/orders/:id/status', requireAuth, async (req, res) => {
     const timestamp = new Date().toLocaleString('es-MX', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
     await db().collection('store_orders').updateOne(
       { id: order.id },
-      { $set: { status: nextStatus }, $push: { statusHistory: { status: nextStatus, timestamp } } }
+      { $set: { status: nextStatus },$push: { statusHistory: { status: nextStatus, timestamp } } }
     );
     changedOrder = await db().collection('store_orders').findOne({ id: order.id });
   }
@@ -203,7 +226,7 @@ router.post('/me/notifications', requireAuth, async (req, res) => {
   const item = { id: `notif-${Date.now()}`, read: false, createdAt: 'Ahora mismo', ...req.body };
   await db().collection('mobile_users').updateOne(
     { id: req.user.id },
-    { $push: { notifications: { $each: [item], $position: 0 } } }
+    { $push: { notifications: { $each: [item],$position: 0 } } }
   );
   const user = await db().collection('mobile_users').findOne({ id: req.user.id });
   res.json(user?.notifications || []);
@@ -240,29 +263,6 @@ router.put('/me/notification-prefs', requireAuth, async (req, res) => {
   res.json(req.body);
 });
 
-function extractUserFromToken(req) {
-  const auth = req.headers.authorization || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) return null;
-  try {
-    return jwt.verify(token, process.env.JWT_SECRET);
-  } catch {
-    return null;
-  }
-}
-
-function buildUserFilter(decoded) {
-  const filters = [];
-  if (decoded?.email) filters.push({ email: decoded.email });
-  if (decoded?.id) filters.push({ id: decoded.id });
-  if (decoded?.userId) filters.push({ id: decoded.userId });
-  const rawId = decoded?.userId || decoded?.id || decoded?._id;
-  if (rawId && mongoose.Types.ObjectId.isValid(rawId)) {
-    filters.push({ _id: new mongoose.Types.ObjectId(rawId) });
-  }
-  return filters.length ? { $or: filters } : null;
-}
-
 // 1. Guardar token Push del celular del usuario
 router.patch('/me/push-token', async (req, res) => {
   try {
@@ -271,7 +271,7 @@ router.patch('/me/push-token', async (req, res) => {
     const { pushToken } = req.body;
     if (!filter || !pushToken) return res.status(400).json({ message: 'Datos incompletos' });
 
-    await mongoose.connection
+    await db()
       .collection('mobile_users')
       .updateOne(filter, { $set: { expoPushToken: pushToken } });
 
@@ -327,14 +327,13 @@ router.get('/isbn/:code', async (req, res) => {
   }
 });
 
-// 3. Publicar un libro nuevo en el catálogo + enviar Push a todos los usuarios
-// Crear solicitud de libro (queda 'pending' si es usuario normal, o 'approved' si tienes canPublish: true)
+// 3. Crear solicitud de libro ('pending' si es usuario normal, 'approved' si tienes canPublish: true)
 router.post('/books', async (req, res) => {
   try {
     const decoded = extractUserFromToken(req);
     const userFilter = buildUserFilter(decoded);
     const submitter = userFilter
-      ? await mongoose.connection.collection('mobile_users').findOne(userFilter)
+      ? await db().collection('mobile_users').findOne(userFilter)
       : null;
 
     const {
@@ -373,17 +372,17 @@ router.post('/books', async (req, res) => {
       description: (description || 'Publicado en el catálogo de BuscaLibroo.').trim(),
       approvalStatus,
       submittedByEmail: submitter?.email || 'lector@buscalibroo.app',
-      submittedByName: submitter?.name || 'Lector',
+      submittedByName: submitter?.username || submitter?.name || 'Lector',
       submittedByPushToken: submitter?.expoPushToken || '',
       createdAt: new Date(),
     };
 
-    await mongoose.connection.collection('store_books').insertOne(newBook);
+    await db().collection('store_books').insertOne(newBook);
 
     if (isCurator) {
-      const users = await mongoose.connection
+      const users = await db()
         .collection('mobile_users')
-        .find({ expoPushToken: { $exists: true, $ne: '' } })
+        .find({ expoPushToken: { $exists: true,$ne: '' } })
         .toArray();
 
       await sendExpoPush(
@@ -391,6 +390,34 @@ router.post('/books', async (req, res) => {
         {
           title: '📚 ¡Nuevo lanzamiento en BuscaLibroo!',
           body: `"${newBook.title}" de ${newBook.authorName} ya está disponible.`,
+          data: { bookId: newBook.id },
+        }
+      );
+    } else {
+      // Avisar al administrador (canPublish: true) dentro de la app y por push
+      const curators = await db()
+        .collection('mobile_users')
+        .find({ canPublish: true })
+        .toArray();
+
+      const adminNotif = {
+        id: `notif-${Date.now()}`,
+        title: '🛡️ Nueva solicitud de libro',
+        body: `${newBook.submittedByName} propuso "${newBook.title}". Revísalo en tu Perfil.`,
+        read: false,
+        createdAt: 'Ahora mismo',
+      };
+
+      await db().collection('mobile_users').updateMany(
+        { canPublish: true },
+        { $push: { notifications: { $each: [adminNotif],$position: 0 } } }
+      );
+
+      await sendExpoPush(
+        curators.map((c) => c.expoPushToken).filter(Boolean),
+        {
+          title: adminNotif.title,
+          body: adminNotif.body,
           data: { bookId: newBook.id },
         }
       );
@@ -407,7 +434,7 @@ router.get('/me/book-requests', async (req, res) => {
   try {
     const decoded = extractUserFromToken(req);
     if (!decoded?.email) return res.json([]);
-    const list = await mongoose.connection
+    const list = await db()
       .collection('store_books')
       .find({ submittedByEmail: decoded.email })
       .sort({ createdAt: -1 })
@@ -425,10 +452,10 @@ router.get('/books/pending', async (req, res) => {
     const filter = buildUserFilter(decoded);
     if (!filter) return res.status(401).json({ message: 'No autorizado' });
 
-    const user = await mongoose.connection.collection('mobile_users').findOne(filter);
+    const user = await db().collection('mobile_users').findOne(filter);
     if (!user?.canPublish) return res.status(403).json({ message: 'Sin permisos' });
 
-    const pending = await mongoose.connection
+    const pending = await db()
       .collection('store_books')
       .find({ approvalStatus: 'pending' })
       .sort({ createdAt: -1 })
@@ -446,7 +473,7 @@ router.patch('/books/:bookId/review', async (req, res) => {
     const filter = buildUserFilter(decoded);
     if (!filter) return res.status(401).json({ message: 'No autorizado' });
 
-    const reviewer = await mongoose.connection.collection('mobile_users').findOne(filter);
+    const reviewer = await db().collection('mobile_users').findOne(filter);
     if (!reviewer?.canPublish) return res.status(403).json({ message: 'Sin permisos' });
 
     const { bookId } = req.params;
@@ -457,30 +484,43 @@ router.patch('/books/:bookId/review', async (req, res) => {
       ? { $or: [{ id: bookId }, { _id: new mongoose.Types.ObjectId(bookId) }] }
       : { id: bookId };
 
-    const book = await mongoose.connection.collection('store_books').findOne(bookQuery);
+    const book = await db().collection('store_books').findOne(bookQuery);
     if (!book) return res.status(404).json({ message: 'Solicitud no encontrada' });
 
-    await mongoose.connection.collection('store_books').updateOne(bookQuery, {
+    await db().collection('store_books').updateOne(bookQuery, {
       $set: { approvalStatus, reviewedAt: new Date() },
     });
 
-    // Notificar al usuario que envió la solicitud
+    const userNotif = {
+      id: `notif-${Date.now()}`,
+      title: action === 'approve' ? '✅ ¡Tu libro fue aprobado!' : '❌ Solicitud no aprobada',
+      body:
+        action === 'approve'
+          ? `"${book.title}" ya está publicado en el catálogo de BuscaLibroo.`
+          : `Tu propuesta "${book.title}" no cumplió los criterios del catálogo.`,
+      read: false,
+      createdAt: 'Ahora mismo',
+    };
+
+    if (book.submittedByEmail) {
+      await db().collection('mobile_users').updateOne(
+        { email: book.submittedByEmail },
+        { $push: { notifications: { $each: [userNotif],$position: 0 } } }
+      );
+    }
+
     if (book.submittedByPushToken) {
       await sendExpoPush([book.submittedByPushToken], {
-        title: action === 'approve' ? '✅ ¡Tu libro fue aprobado!' : '❌ Solicitud no aprobada',
-        body:
-          action === 'approve'
-            ? `"${book.title}" ya está publicado en el catálogo de BuscaLibroo.`
-            : `Tu propuesta "${book.title}" no cumplió los criterios del catálogo.`,
+        title: userNotif.title,
+        body: userNotif.body,
         data: { bookId: book.id },
       });
     }
 
-    // Si se aprobó, notificar el nuevo libro a todos los usuarios
     if (action === 'approve') {
-      const users = await mongoose.connection
+      const users = await db()
         .collection('mobile_users')
-        .find({ expoPushToken: { $exists: true, $ne: '' } })
+        .find({ expoPushToken: { $exists: true,$ne: '' } })
         .toArray();
 
       await sendExpoPush(
@@ -509,7 +549,7 @@ router.patch('/me/orders/:orderId/progress', async (req, res) => {
       ? { $or: [{ id: orderId }, { _id: new mongoose.Types.ObjectId(orderId) }] }
       : { id: orderId };
 
-    await mongoose.connection.collection('store_orders').updateOne(query, {
+    await db().collection('store_orders').updateOne(query, {
       $set: {
         [`readingProgress.${bookId}`]: {
           currentPage: Number(currentPage || 0),
