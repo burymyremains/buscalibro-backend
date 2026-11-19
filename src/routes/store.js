@@ -2,8 +2,6 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import { requireAuth } from '../middleware/auth.js';
-import mongoose from 'mongoose';
-import jwt from 'jsonwebtoken';
 import { sendExpoPush } from '../utils/pushService.js';
 
 const router = Router();
